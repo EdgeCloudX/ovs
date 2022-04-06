@@ -198,7 +198,7 @@ struct raft {
      * most recently added to 'log'. */
     struct hmap servers;
 
-#define ELECTION_BASE_MSEC 1000
+#define ELECTION_BASE_MSEC 5000
 #define ELECTION_RANGE_MSEC 1000
     /* The election timeout base value for leader election, in milliseconds.
      * It can be set by unixctl cluster/change-election-timer. Default value is
