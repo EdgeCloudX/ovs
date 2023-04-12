@@ -31,6 +31,7 @@
 #include "netdev-linux.h"
 #include "netdev-offload-provider.h"
 #include "netdev-provider.h"
+#include "netdev-vport.h"
 #include "netlink.h"
 #include "netlink-socket.h"
 #include "odp-netlink.h"
@@ -55,6 +56,12 @@ struct netlink_field
     int offset;
     int flower_offset;
     int size;
+};
+
+struct chain_node
+{
+    struct hmap_node node;
+    uint32_t chain;
 };
 
 static bool
@@ -323,6 +330,73 @@ get_block_id_from_netdev(struct netdev *netdev)
 }
 
 static int
+get_chains_from_netdev(struct netdev *netdev, struct tcf_id *id,
+                       struct hmap *map)
+{
+    struct netdev_flow_dump *dump;
+    struct chain_node *chain_node;
+    struct ofpbuf rbuffer, reply;
+    uint32_t chain;
+    size_t hash;
+    int err;
+
+    dump = xzalloc(sizeof *dump);
+    dump->nl_dump = xzalloc(sizeof *dump->nl_dump);
+    dump->netdev = netdev_ref(netdev);
+
+    ofpbuf_init(&rbuffer, NL_DUMP_BUFSIZE);
+    tc_dump_tc_chain_start(id, dump->nl_dump);
+
+    while (nl_dump_next(dump->nl_dump, &reply, &rbuffer))
+    {
+        if (parse_netlink_to_tc_chain(&reply, &chain))
+        {
+            continue;
+        }
+
+        chain_node = xzalloc(sizeof *chain_node);
+        chain_node->chain = chain;
+        hash = hash_int(chain, 0);
+        hmap_insert(map, &chain_node->node, hash);
+    }
+
+    err = nl_dump_done(dump->nl_dump);
+    ofpbuf_uninit(&rbuffer);
+    netdev_close(netdev);
+    free(dump->nl_dump);
+    free(dump);
+
+    return err;
+}
+
+static int
+delete_chains_from_netdev(struct netdev *netdev, struct tcf_id *id)
+{
+    struct chain_node *chain_node;
+    struct hmap map;
+    int error;
+
+    hmap_init(&map);
+    error = get_chains_from_netdev(netdev, id, &map);
+
+    if (!error)
+    {
+        /* Flush rules explicitly needed when we work with ingress_block,
+         * so we will not fail with reattaching block to bond iface, for ex.
+         */
+        HMAP_FOR_EACH_POP(chain_node, node, &map)
+        {
+            id->chain = chain_node->chain;
+            tc_del_filter(id);
+            free(chain_node);
+        }
+    }
+
+    hmap_destroy(&map);
+    return error;
+}
+
+static int
 netdev_tc_flow_flush(struct netdev *netdev)
 {
     struct ufid_tc_data *data, *next;
@@ -393,10 +467,10 @@ netdev_tc_flow_dump_destroy(struct netdev_flow_dump *dump)
 
 static void
 parse_flower_rewrite_to_netlink_action(struct ofpbuf *buf,
-                                       struct tc_flower *flower)
+                                       struct tc_action *action)
 {
-    char *mask = (char *)&flower->rewrite.mask;
-    char *data = (char *)&flower->rewrite.key;
+    char *mask = (char *)&action->rewrite.mask;
+    char *data = (char *)&action->rewrite.key;
 
     for (int type = 0; type < ARRAY_SIZE(set_flower_map); type++)
     {
@@ -508,8 +582,10 @@ parse_tc_flower_to_stats(struct tc_flower *flower,
     }
 
     memset(stats, 0, sizeof *stats);
-    stats->n_packets = get_32aligned_u64(&flower->stats.n_packets);
-    stats->n_bytes = get_32aligned_u64(&flower->stats.n_bytes);
+    stats->n_packets = get_32aligned_u64(&flower->stats_sw.n_packets);
+    stats->n_packets += get_32aligned_u64(&flower->stats_hw.n_packets);
+    stats->n_bytes = get_32aligned_u64(&flower->stats_sw.n_bytes);
+    stats->n_bytes += get_32aligned_u64(&flower->stats_hw.n_bytes);
     stats->used = flower->lastused;
 }
 
@@ -666,6 +742,14 @@ parse_tc_flower_to_match(struct tc_flower *flower,
         {
             match_set_tp_dst_masked(match, key->sctp_dst, mask->sctp_dst);
             match_set_tp_src_masked(match, key->sctp_src, mask->sctp_src);
+        }
+        else if (key->ip_proto == IPPROTO_ICMP ||
+                 key->ip_proto == IPPROTO_ICMPV6)
+        {
+            match_set_tp_dst_masked(match, htons(key->icmp_code),
+                                    htons(mask->icmp_code));
+            match_set_tp_src_masked(match, htons(key->icmp_type),
+                                    htons(mask->icmp_type));
         }
 
         if (mask->ct_state)
@@ -845,7 +929,7 @@ parse_tc_flower_to_match(struct tc_flower *flower,
             break;
             case TC_ACT_PEDIT:
             {
-                parse_flower_rewrite_to_netlink_action(buf, flower);
+                parse_flower_rewrite_to_netlink_action(buf, action);
             }
             break;
             case TC_ACT_ENCAP:
@@ -1250,8 +1334,8 @@ parse_put_flow_set_masked_action(struct tc_flower *flower,
     uint64_t set_stub[1024 / 8];
     struct ofpbuf set_buf = OFPBUF_STUB_INITIALIZER(set_stub);
     char *set_data, *set_mask;
-    char *key = (char *)&flower->rewrite.key;
-    char *mask = (char *)&flower->rewrite.mask;
+    char *key = (char *)&action->rewrite.key;
+    char *mask = (char *)&action->rewrite.mask;
     const struct nlattr *attr;
     int i, j, type;
     size_t size;
@@ -1296,16 +1380,6 @@ parse_put_flow_set_masked_action(struct tc_flower *flower,
         }
     }
 
-    if (!is_all_zeros(&flower->rewrite, sizeof flower->rewrite))
-    {
-        if (flower->rewrite.rewrite == false)
-        {
-            flower->rewrite.rewrite = true;
-            action->type = TC_ACT_PEDIT;
-            flower->action_count++;
-        }
-    }
-
     if (hasmask && !is_all_zeros(set_mask, size))
     {
         VLOG_DBG_RL(&rl, "unsupported sub attribute of set action type %d",
@@ -1315,6 +1389,8 @@ parse_put_flow_set_masked_action(struct tc_flower *flower,
     }
 
     ofpbuf_uninit(&set_buf);
+    action->type = TC_ACT_PEDIT;
+    flower->action_count++;
     return 0;
 }
 
@@ -1408,6 +1484,24 @@ parse_put_flow_set_action(struct tc_flower *flower, struct tc_action *action,
     return 0;
 }
 
+static bool
+is_ipv6_fragment_and_masked(const struct flow *key, const struct flow *mask)
+{
+    if (key->dl_type != htons(ETH_P_IPV6))
+    {
+        return false;
+    }
+    if (mask->nw_proto && key->nw_proto == IPPROTO_FRAGMENT)
+    {
+        return true;
+    }
+    if (key->nw_frag & (mask->nw_frag & FLOW_NW_FRAG_ANY))
+    {
+        return true;
+    }
+    return false;
+}
+
 static int
 test_key_and_mask(struct match *match)
 {
@@ -1485,23 +1579,7 @@ test_key_and_mask(struct match *match)
     }
 
     if (key->dl_type == htons(ETH_TYPE_IP) &&
-        key->nw_proto == IPPROTO_ICMP)
-    {
-        if (mask->tp_src)
-        {
-            VLOG_DBG_RL(&rl,
-                        "offloading attribute icmp_type isn't supported");
-            return EOPNOTSUPP;
-        }
-        if (mask->tp_dst)
-        {
-            VLOG_DBG_RL(&rl,
-                        "offloading attribute icmp_code isn't supported");
-            return EOPNOTSUPP;
-        }
-    }
-    else if (key->dl_type == htons(ETH_TYPE_IP) &&
-             key->nw_proto == IPPROTO_IGMP)
+        key->nw_proto == IPPROTO_IGMP)
     {
         if (mask->tp_src)
         {
@@ -1516,26 +1594,16 @@ test_key_and_mask(struct match *match)
             return EOPNOTSUPP;
         }
     }
-    else if (key->dl_type == htons(ETH_TYPE_IPV6) &&
-             key->nw_proto == IPPROTO_ICMPV6)
-    {
-        if (mask->tp_src)
-        {
-            VLOG_DBG_RL(&rl,
-                        "offloading attribute icmpv6_type isn't supported");
-            return EOPNOTSUPP;
-        }
-        if (mask->tp_dst)
-        {
-            VLOG_DBG_RL(&rl,
-                        "offloading attribute icmpv6_code isn't supported");
-            return EOPNOTSUPP;
-        }
-    }
     else if (key->dl_type == htons(OFP_DL_TYPE_NOT_ETH_TYPE))
     {
         VLOG_DBG_RL(&rl,
                     "offloading of non-ethernet packets isn't supported");
+        return EOPNOTSUPP;
+    }
+
+    if (is_ipv6_fragment_and_masked(key, mask))
+    {
+        VLOG_DBG_RL(&rl, "offloading of IPv6 fragments isn't supported");
         return EOPNOTSUPP;
     }
 
@@ -1874,7 +1942,7 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
         memset(&mask->arp_tha, 0, sizeof mask->arp_tha);
     }
 
-    if (is_ip_any(key))
+    if (is_ip_any(key) && !is_ipv6_fragment_and_masked(key, mask))
     {
         flower.key.ip_proto = key->nw_proto;
         flower.mask.ip_proto = mask->nw_proto;
@@ -1938,6 +2006,16 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
             mask->tp_src = 0;
             mask->tp_dst = 0;
         }
+        else if (key->nw_proto == IPPROTO_ICMP ||
+                 key->nw_proto == IPPROTO_ICMPV6)
+        {
+            flower.key.icmp_code = (uint8_t)ntohs(key->tp_dst);
+            flower.mask.icmp_code = (uint8_t)ntohs(mask->tp_dst);
+            flower.key.icmp_type = (uint8_t)ntohs(key->tp_src);
+            flower.mask.icmp_type = (uint8_t)ntohs(mask->tp_src);
+            mask->tp_src = 0;
+            mask->tp_dst = 0;
+        }
 
         if (key->dl_type == htons(ETH_P_IP))
         {
@@ -1992,7 +2070,27 @@ netdev_tc_flow_put(struct netdev *netdev, struct match *match,
                 VLOG_DBG_RL(&rl, "Can't find netdev for output port %d", port);
                 return ENODEV;
             }
+
+            if (!netdev_flow_api_equals(netdev, outdev))
+            {
+                VLOG_DBG_RL(&rl,
+                            "Flow API provider mismatch between ingress (%s) "
+                            "and egress (%s) ports",
+                            netdev_get_name(netdev), netdev_get_name(outdev));
+                netdev_close(outdev);
+                return EOPNOTSUPP;
+            }
+
             action->out.ifindex_out = netdev_get_ifindex(outdev);
+            if (action->out.ifindex_out < 0)
+            {
+                VLOG_DBG_RL(&rl,
+                            "Can't find ifindex for output port %s, error %d",
+                            netdev_get_name(outdev), action->out.ifindex_out);
+                netdev_close(outdev);
+                return -action->out.ifindex_out;
+            }
+
             action->out.ingress = is_internal_port(netdev_get_type(outdev));
             action->type = TC_ACT_OUTPUT;
             flower.action_count++;
@@ -2203,9 +2301,7 @@ netdev_tc_flow_del(struct netdev *netdev OVS_UNUSED,
         memset(stats, 0, sizeof *stats);
         if (!tc_get_flower(&id, &flower))
         {
-            stats->n_packets = get_32aligned_u64(&flower.stats.n_packets);
-            stats->n_bytes = get_32aligned_u64(&flower.stats.n_bytes);
-            stats->used = flower.lastused;
+            parse_tc_flower_to_stats(&flower, stats);
         }
     }
 
@@ -2398,13 +2494,20 @@ probe_tc_block_support(int ifindex)
 static int
 netdev_tc_init_flow_api(struct netdev *netdev)
 {
-    static struct ovsthread_once multi_mask_once = OVSTHREAD_ONCE_INITIALIZER;
-    static struct ovsthread_once block_once = OVSTHREAD_ONCE_INITIALIZER;
+    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
     enum tc_qdisc_hook hook = get_tc_qdisc_hook(netdev);
+    static bool get_chain_supported = true;
     uint32_t block_id = 0;
     struct tcf_id id;
     int ifindex;
     int error;
+
+    if (netdev_vport_is_vport_class(netdev->netdev_class) && strcmp(netdev_get_dpif_type(netdev), "system"))
+    {
+        VLOG_DBG("%s: vport doesn't belong to the system datapath. Skipping.",
+                 netdev_get_name(netdev));
+        return EOPNOTSUPP;
+    }
 
     ifindex = netdev_get_ifindex(netdev);
     if (ifindex < 0)
@@ -2415,29 +2518,34 @@ netdev_tc_init_flow_api(struct netdev *netdev)
     }
 
     block_id = get_block_id_from_netdev(netdev);
-
-    /* Flush rules explicitly needed when we work with ingress_block,
-     * so we will not fail with reattaching block to bond iface, for ex.
-     */
     id = tc_make_tcf_id(ifindex, block_id, 0, hook);
-    tc_del_filter(&id);
+
+    if (get_chain_supported)
+    {
+        if (delete_chains_from_netdev(netdev, &id))
+        {
+            get_chain_supported = false;
+        }
+    }
+
+    /* fallback here if delete chains fail */
+    if (!get_chain_supported)
+    {
+        tc_del_filter(&id);
+    }
 
     /* make sure there is no ingress/egress qdisc */
     tc_add_del_qdisc(ifindex, false, 0, hook);
 
-    if (ovsthread_once_start(&block_once))
+    if (ovsthread_once_start(&once))
     {
         probe_tc_block_support(ifindex);
         /* Need to re-fetch block id as it depends on feature availability. */
         block_id = get_block_id_from_netdev(netdev);
-        ovsthread_once_done(&block_once);
-    }
 
-    if (ovsthread_once_start(&multi_mask_once))
-    {
         probe_multi_mask_per_prio(ifindex);
         probe_ct_state_support(ifindex);
-        ovsthread_once_done(&multi_mask_once);
+        ovsthread_once_done(&once);
     }
 
     error = tc_add_del_qdisc(ifindex, true, block_id, hook);
