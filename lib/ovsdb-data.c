@@ -1949,6 +1949,19 @@ ovsdb_datum_add_unsafe(struct ovsdb_datum *datum,
 }
 
 void
+ovsdb_datum_add_from_index_unsafe(struct ovsdb_datum *dst,
+                                  const struct ovsdb_datum *src,
+                                  size_t idx,
+                                  const struct ovsdb_type *type)
+{
+    const union ovsdb_atom *key = &src->keys[idx];
+    const union ovsdb_atom *value = type->value.type != OVSDB_TYPE_VOID
+                                    ? &src->values[idx]
+                                    : NULL;
+    ovsdb_datum_add_unsafe(dst, key, value, type, NULL);
+}
+
+void
 ovsdb_datum_union(struct ovsdb_datum *a, const struct ovsdb_datum *b,
                   const struct ovsdb_type *type, bool replace)
 {
@@ -2064,7 +2077,60 @@ ovsdb_symbol_table_insert(struct ovsdb_symbol_table *symtab,
     }
     return symbol;
 }
-
+/* APIs for Generating and apply diffs.  */
+
+/* Find what needs to be added to and removed from 'old' to construct 'new'.
+ *
+ * The 'added' and 'removed' datums are always safe; the orders of keys are
+ * maintained since they are added in order.   */
+void
+ovsdb_datum_added_removed(struct ovsdb_datum *added,
+                          struct ovsdb_datum *removed,
+                          const struct ovsdb_datum *old,
+                          const struct ovsdb_datum *new,
+                          const struct ovsdb_type *type)
+{
+    size_t oi, ni;
+
+    ovsdb_datum_init_empty(added);
+    ovsdb_datum_init_empty(removed);
+    if (!ovsdb_type_is_composite(type)) {
+        ovsdb_datum_clone(removed, old, type);
+        ovsdb_datum_clone(added, new, type);
+        return;
+    }
+
+    /* Generate the diff in O(n) time. */
+    for (oi = ni = 0; oi < old->n && ni < new->n;) {
+        int c = ovsdb_atom_compare_3way(&old->keys[oi], &new->keys[ni],
+                                        type->key.type);
+        if (c < 0) {
+            ovsdb_datum_add_from_index_unsafe(removed, old, oi, type);
+            oi++;
+        } else if (c > 0) {
+            ovsdb_datum_add_from_index_unsafe(added, new, ni, type);
+            ni++;
+        } else {
+            if (type->value.type != OVSDB_TYPE_VOID &&
+                ovsdb_atom_compare_3way(&old->values[oi], &new->values[ni],
+                                        type->value.type)) {
+                ovsdb_datum_add_unsafe(removed, &old->keys[oi],
+                                       &old->values[oi], type, NULL);
+                ovsdb_datum_add_unsafe(added, &new->keys[ni], &new->values[ni],
+                                       type, NULL);
+            }
+            oi++; ni++;
+        }
+    }
+
+    for (; oi < old->n; oi++) {
+        ovsdb_datum_add_from_index_unsafe(removed, old, oi, type);
+    }
+
+    for (; ni < new->n; ni++) {
+        ovsdb_datum_add_from_index_unsafe(added, new, ni, type);
+    }
+}
 /* APIs for Generating and apply diffs.  */
 
 /* Generate a difference ovsdb_dataum between 'old' and 'new'.

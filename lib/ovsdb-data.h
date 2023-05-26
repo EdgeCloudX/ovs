@@ -235,6 +235,13 @@ void ovsdb_datum_subtract(struct ovsdb_datum *a,
                           const struct ovsdb_type *b_type);
 
 /* Generate and apply diffs */
+void ovsdb_datum_added_removed(struct ovsdb_datum *added,
+                               struct ovsdb_datum *removed,
+                               const struct ovsdb_datum *old,
+                               const struct ovsdb_datum *new,
+                               const struct ovsdb_type *type);
+
+/* Generate and apply diffs */
 void ovsdb_datum_diff(struct ovsdb_datum *diff,
                       const struct ovsdb_datum *old_datum,
                       const struct ovsdb_datum *new_datum,
@@ -254,6 +261,10 @@ void ovsdb_datum_add_unsafe(struct ovsdb_datum *,
                             const union ovsdb_atom *value,
                             const struct ovsdb_type *,
                             const union ovsdb_atom *range_end_atom);
+void ovsdb_datum_add_from_index_unsafe(struct ovsdb_datum *dst,
+                                       const struct ovsdb_datum *src,
+                                       size_t idx,
+                                       const struct ovsdb_type *type);
 
 /* Transactions with named-uuid row names. */
 struct json *ovsdb_datum_to_json_with_row_names(const struct ovsdb_datum *,
