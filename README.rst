@@ -136,3 +136,19 @@ Contact
 -------
 
 bugs@openvswitch.org
+
+add kube-ovn support commit 
+     # ovsdb-idl: Support write-only-changed IDL monitor mode
+    curl -s https://github.com/kubeovn/ovs/commit/bef703ef862fbbf8740b8d5bf6ca8df9ed617da5.patch | git apply 
+    # fix memleak
+    curl -s https://github.com/kubeovn/ovs/commit/3cf5c5236494b5f54dd2c363f2b547f9d90b372d.patch | git apply 
+    # fix log file descriptor leak in monitor process
+    curl -s https://github.com/kubeovn/ovs/commit/9bce4a9bced0d699ebbb2893bc68448bb0243846.patch | git apply 
+    # increase election timer
+    curl -s https://github.com/kubeovn/ovs/commit/28ee0fc71cd4256fc422fff30d13e2aa0028cfca.patch | git apply 
+    # add fdb update logging
+    curl -s https://github.com/kubeovn/ovs/commit/e3ed5ec298e2427b77dd2252e8c2218894e45220.patch | git apply 
+    # fdb: fix mac learning in environments with hairpin enabled
+    curl -s https://github.com/kubeovn/ovs/commit/b721a251dadfb0857a2aebe32611d18ca935421f.patch | git apply 
+    # ovsdb-tool: add optional server id parameter for "join-cluster" command
+    curl -s https://github.com/kubeovn/ovs/commit/0664cbe47d1684ca5b7147e3449779635454970e.patch | git apply
